@@ -41,7 +41,12 @@ async function downloadVPKDir(user, manifest) {
     try {
         await user.downloadFile(appId, depotId, dirFile, `${temp}/pak01_dir.vpk`);
     } catch (error) {
-        console.error(`❌ Failed to download pak01_dir.vpk: ${error.message}`);
+        if (error instanceof AggregateError) {
+            console.error(`❌ Failed to download pak01_dir.vpk: Multiple errors occurred`);
+            error.errors.forEach(e => console.error(e));
+        } else {
+            console.error(`❌ Failed to download pak01_dir.vpk: ${error}`);
+        }
         return null; // Return null to handle failure gracefully
     }
 
@@ -73,6 +78,22 @@ function getRequiredVPKFiles(vpkDir) {
     return requiredIndices.sort((a, b) => a - b);
 }
 
+async function downloadWithRetry(user, appId, depotId, file, filePath, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            await user.downloadFile(appId, depotId, file, filePath);
+            return true;
+        } catch (error) {
+            if (attempt === maxRetries) {
+                throw error;
+            }
+            const backoffTime = Math.min(60000 * Math.pow(2, attempt - 1), 300000); // 1min, 2min, 4min, max 5min
+            console.log(`⚠️ Download failed, retrying in ${backoffTime/60000} minutes (attempt ${attempt}/${maxRetries})`);
+            await delay(backoffTime);
+        }
+    }
+}
+
 async function downloadVPKArchives(user, manifest, vpkDir) {
     if (!vpkDir) {
         console.error("⚠️ Skipping VPK archive downloads due to previous failure.");
@@ -80,12 +101,10 @@ async function downloadVPKArchives(user, manifest, vpkDir) {
     }
 
     const requiredIndices = getRequiredVPKFiles(vpkDir);
-    // console.log(`Required VPK files: ${requiredIndices}`);
+    const failedDownloads = [];
 
     for (let index = 0; index < requiredIndices.length; index++) {
         const archiveIndex = requiredIndices[index];
-
-        // Pad index with zeroes (e.g., 001, 002)
         const paddedIndex = archiveIndex.toString().padStart(3, "0");
         const fileName = `pak01_${paddedIndex}.vpk`;
 
@@ -95,24 +114,34 @@ async function downloadVPKArchives(user, manifest, vpkDir) {
         const filePath = `${temp}/${fileName}`;
 
         const status = `[${index + 1}/${requiredIndices.length}]`;
-
         console.log(`${status} Downloading ${fileName}`);
 
         try {
-            await user.downloadFile(appId, depotId, file, filePath);
+            await downloadWithRetry(user, appId, depotId, file, filePath);
             console.log(`✅ Successfully downloaded ${fileName}`);
         } catch (error) {
-            console.error(`❌ Failed to download ${fileName}: ${error.message}`);
+            if (error instanceof AggregateError) {
+                console.error(`❌ Failed to download ${fileName}:`);
+                error.errors.forEach(e => console.error(`  - ${e.message}`));
+            } else {
+                console.error(`❌ Failed to download ${fileName}: ${error}`);
+            }
+            failedDownloads.push(fileName);
         }
 
-        // Add a delay of 3 seconds between downloads to avoid rate limiting
-        await delay(3000);
+        // Increased delay between downloads to 5 seconds
+        await delay(5000);
+    }
+
+    if (failedDownloads.length > 0) {
+        console.log("\n⚠️ The following files failed to download:");
+        failedDownloads.forEach(file => console.log(`  - ${file}`));
     }
 }
 
-if (process.argv.length != 4) {
+if (process.argv.length != 4 && process.argv.length != 5) {
     console.error(
-        `Missing input arguments, expected 4 got ${process.argv.length}`
+        `Missing input arguments, expected 4 or 5 got ${process.argv.length}`
     );
     process.exit(1);
 }
@@ -163,12 +192,12 @@ user.once("loggedOn", async () => {
         }
     }
 
-    if (existingManifestId == latestManifestId) {
+    if (existingManifestId == latestManifestId && process.argv[4] !== '--force') {
         console.log("⚠️ Latest manifest ID matches existing manifest ID, exiting.");
         process.exit(0);
     }
 
-    console.log("🔄 Manifest ID changed, downloading new files...");
+    console.log("🔄 Manifest ID changed or force flag used, downloading new files...");
 
     let manifest;
     try {
